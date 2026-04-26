@@ -229,6 +229,28 @@ TF_INDIA = {
     "1d":  (1440, 1080, 86400),
 }
 
+NIFTY_50 = [
+    "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "BHARTIARTL", "INFY", "SBIN", "LICI", "ITC", "HINDUNILVR",
+    "LT", "BAJFINANCE", "ADANIENT", "SUNPHARMA", "M&M", "ADANIPORTS", "MARUTI", "KOTAKBANK", "HCLTECH", "TITAN",
+    "AXISBANK", "ULTRACEMCO", "NTPC", "ONGC", "ASIANPAINT", "COALINDIA", "TATASTEEL", "ADANIPOWER", "POWERGRID", "ADANIGREEN",
+    "JSWSTEEL", "ADANITRANS", "SBILIFE", "GRASIM", "HINDALCO", "BAJAJFINSV", "NESTLEIND", "BAJAJ-AUTO", "BRITANNIA", "EICHERMOT",
+    "TECHM", "WIPRO", "INDUSINDBK", "CIPLA", "APOLLOHOSP", "HEROMOTOCO", "DIVISLAB", "LTIM", "BPCL", "TATAMOTORS"
+]
+
+NIFTY_MIDCAP_150 = [
+    "PFC", "RECLTD", "TVSMOTOR", "LUPIN", "MRF", "AUROPHARMA", "ASHOKLEY", "IDFCFIRSTB", "ASTRAL", "CUMMINSIND",
+    "VOLTAS", "OBEROIRLTY", "JUBLFOOD", "IDEA", "BIOCON", "BANDHANBNK", "ZEEL", "PAYTM", "ZOMATO", "NYKAA",
+    "POLICYBZR", "MOTHERSON", "BHEL", "SAIL", "CONCOR", "ABCAPITAL", "ESCORTS", "COROMANDEL", "MFSL", "DALBHARAT"
+]
+
+NIFTY_SMALLCAP_250 = [
+    "SUZLON", "IRFC", "RVNL", "MAZDOCK", "KALYANKJIL", "ANGELONE", "CDSL", "BSE", "MCX", "RADICO",
+    "CEATLTD", "BLS", "LATENTVIEW", "CYIENT", "ZENSARTECH", "SONACOMS", "CAMS", "HAPPSTMNDS", "GLENMARK", "JBCHEPHARM",
+    "GRANULES", "NATCOPHARM", "UCOBANK", "CENTRALBK", "IOB", "MAHABANK", "J&KBANK", "CSBBANK", "KARURVYSYA", "SOUTHBANK"
+]
+
+NIFTY_500 = list(set(NIFTY_50 + NIFTY_MIDCAP_150 + NIFTY_SMALLCAP_250))
+
 # ─── Data Fetchers ────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -729,6 +751,136 @@ def get_coindcx_gainers():
     except Exception as e:
         logger.error(f"Error fetching CoinDCX gainers: {e}")
         return [], datetime.now().strftime("%H:%M:%S")
+
+def analyze_pump_dump_candidates(mode="PUMP"):
+    """
+    Deep scan of CoinDCX tickers to find 'Pump' or 'Dump' candidates.
+    mode: 'PUMP' or 'DUMP'
+    """
+    try:
+        # Fetch current prices to get all symbols
+        url_rt = "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
+        resp_rt = requests.get(url_rt, timeout=10).json()
+        prices = resp_rt.get("prices", {})
+        
+        # Sort by 24h gain and scan top 30 to keep it fast
+        tickers = sorted(prices.keys(), key=lambda x: prices[x].get("pc", 0), reverse=(mode=="PUMP"))[:30]
+        
+        candidates = []
+        for symbol in tickers:
+            try:
+                # Fetch context
+                df = fetch_coindcx_ohlcv(symbol, "1h", limit=24) # 24h
+                df_5m = fetch_coindcx_ohlcv(symbol, "5m", limit=24) # 2h
+                
+                if df_5m.empty or len(df_5m) < 20: continue
+                
+                price = df_5m.iloc[-1]['close']
+                # Volume surging check
+                vol_recent = df_5m['volume'].mean()
+                vol_24h = df['volume'].mean()
+                v_surge = vol_recent / vol_24h if vol_24h > 0 else 1.0
+                
+                st_sig, _ = supertrend(df_5m)
+                vw = vwap(df_5m)
+                rsi_val = rsi(df_5m['close']).iloc[-1]
+                bull_p, bear_p = detect_patterns(df_5m)
+                
+                # S/R context
+                sh, sl = df_5m['high'].max(), df_5m['low'].min()
+                breakout = price > sh * 0.998
+                breakdown = price < sl * 1.002
+                
+                prob = 40 # Base prob
+                reasons = []
+                
+                if mode == "PUMP":
+                    if v_surge > 1.3: prob += 15; reasons.append(f"Vol Surge {v_surge:.1f}x")
+                    if st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bullish")
+                    if price > vw.iloc[-1]: prob += 10; reasons.append("Above VWAP")
+                    if rsi_val > 65: prob += 10; reasons.append("Strong Momentum")
+                    if bull_p: prob += 15; reasons.append("Bull Patterns")
+                    if breakout: prob += 10; reasons.append("Resistance Breakout")
+                    if bear_p: prob -= 20
+                else: # DUMP
+                    if v_surge > 1.3: prob += 15; reasons.append(f"Heavy Volume {v_surge:.1f}x")
+                    if not st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bearish")
+                    if price < vw.iloc[-1]: prob += 10; reasons.append("Below VWAP")
+                    if rsi_val < 35: prob += 10; reasons.append("Weak Momentum")
+                    if bear_p: prob += 15; reasons.append("Bear Patterns")
+                    if breakdown: prob += 10; reasons.append("Support Breakdown")
+                    if bull_p: prob -= 20
+                
+                prob = max(10, min(98, prob))
+                if prob >= 65:
+                    display_name = symbol.replace("B-", "").replace("_", "")
+                    candidates.append({
+                        "Symbol": display_name,
+                        "Prob": f"{prob}%",
+                        "Signal": reasons[0] if reasons else "Multiple Factors",
+                        "Score": prob
+                    })
+            except: continue
+        return sorted(candidates, key=lambda x: x['Score'], reverse=True)
+    except Exception as e:
+        logger.error(f"Scanner error: {e}")
+        return []
+
+def analyze_groww_pump_dump_candidates(token, exchange="NSE", mode="PUMP", ticker_list=NIFTY_50):
+    """
+    Scan top Indian stocks for Pump/Dump potential.
+    """
+    if not token:
+        return [{"Symbol": "TOKEN MISSING", "Prob": "0%", "Signal": "Enter Groww Token", "Score": 0}]
+        
+    candidates = []
+    # Scan first 30 for speed
+    for symbol in ticker_list[:30]:
+        try:
+            # Fetch context
+            df = fetch_groww_ohlcv(symbol, exchange, "1h", token, limit=24) # 24h
+            df_5m = fetch_groww_ohlcv(symbol, exchange, "5m", token, limit=24) # 2h
+            
+            if df_5m.empty or len(df_5m) < 20: continue
+            
+            price = df_5m.iloc[-1]['close']
+            vol_recent = df_5m['volume'].mean()
+            vol_24h = df['volume'].mean()
+            v_surge = vol_recent / vol_24h if vol_24h > 0 else 1.0
+            
+            st_sig, _ = supertrend(df_5m)
+            vw = vwap(df_5m)
+            rsi_val = rsi(df_5m['close']).iloc[-1]
+            bull_p, bear_p = detect_patterns(df_5m)
+            
+            prob = 35 # Base
+            reasons = []
+            
+            if mode == "PUMP":
+                if v_surge > 1.2: prob += 15; reasons.append(f"Vol Surge {v_surge:.1f}x")
+                if st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bullish")
+                if price > vw.iloc[-1]: prob += 10; reasons.append("Above VWAP")
+                if bull_p: prob += 15; reasons.append("Bull Patterns")
+                if rsi_val > 60: prob += 10; reasons.append("Momentum")
+                if bear_p: prob -= 20
+            else: # DUMP
+                if v_surge > 1.2: prob += 15; reasons.append(f"Heavy Volume {v_surge:.1f}x")
+                if not st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bearish")
+                if price < vw.iloc[-1]: prob += 10; reasons.append("Below VWAP")
+                if bear_p: prob += 15; reasons.append("Bear Patterns")
+                if rsi_val < 40: prob += 10; reasons.append("Weakness")
+                if bull_p: prob -= 20
+                
+            prob = max(10, min(95, prob))
+            if prob >= 60:
+                candidates.append({
+                    "Symbol": symbol,
+                    "Prob": f"{prob}%",
+                    "Signal": reasons[0] if reasons else "Multiple Factors",
+                    "Score": prob
+                })
+        except: continue
+    return sorted(candidates, key=lambda x: x['Score'], reverse=True)
 
 def fetch_coindcx_ohlcv(symbol, resolution, limit=1000):
     """
@@ -1333,6 +1485,27 @@ with st.sidebar:
         tickers_to_analyse = selected_gainers
         is_india = False
         currency = "$"
+        
+        st.markdown("---")
+        st.subheader("🚀 Pump & Dump Scanner")
+        col_p, col_d = st.columns(2)
+        if col_p.button("🔥 PUMP", use_container_width=True):
+            with st.spinner("Scanning for Pump candidates..."):
+                st.session_state.scan_results = analyze_pump_dump_candidates(mode="PUMP")
+            st.session_state.scan_mode = "PUMP"
+        if col_d.button("📉 DUMP", use_container_width=True):
+            with st.spinner("Scanning for Dump candidates..."):
+                st.session_state.scan_results = analyze_pump_dump_candidates(mode="DUMP")
+            st.session_state.scan_mode = "DUMP"
+            
+        if "scan_results" in st.session_state:
+            mode = st.session_state.scan_mode
+            st.markdown(f"**Potential {mode}s:**")
+            if not st.session_state.scan_results:
+                st.info("No strong candidates found.")
+            else:
+                for res in st.session_state.scan_results:
+                    st.write(f"• **{res['Symbol']}**: {res['Prob']} ({res['Signal']})")
     else:
         # Groww
         st.markdown(
@@ -1361,6 +1534,42 @@ with st.sidebar:
         tickers_to_analyse = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
         is_india = True
         currency = "₹"
+        
+        st.markdown("---")
+        st.subheader("🚀 NSE Pump & Dump Scanner")
+        
+        index_choice = st.selectbox(
+            "Scan Universe", 
+            ["NIFTY 50", "NIFTY MIDCAP 150", "NIFTY SMALLCAP 250", "NIFTY 500"]
+        )
+        
+        if index_choice == "NIFTY 50":
+            scan_list = NIFTY_50
+        elif index_choice == "NIFTY MIDCAP 150":
+            scan_list = NIFTY_MIDCAP_150
+        elif index_choice == "NIFTY SMALLCAP 250":
+            scan_list = NIFTY_SMALLCAP_250
+        else:
+            scan_list = NIFTY_500
+            
+        col_p, col_d = st.columns(2)
+        if col_p.button("🔥 PUMP", use_container_width=True, key="groww_pump"):
+            with st.spinner(f"Scanning {index_choice} for Pump candidates..."):
+                st.session_state.g_scan_results = analyze_groww_pump_dump_candidates(groww_token, groww_exchange, mode="PUMP", ticker_list=scan_list)
+            st.session_state.g_scan_mode = "PUMP"
+        if col_d.button("📉 DUMP", use_container_width=True, key="groww_dump"):
+            with st.spinner(f"Scanning {index_choice} for Dump candidates..."):
+                st.session_state.g_scan_results = analyze_groww_pump_dump_candidates(groww_token, groww_exchange, mode="DUMP", ticker_list=scan_list)
+            st.session_state.g_scan_mode = "DUMP"
+            
+        if "g_scan_results" in st.session_state:
+            mode = st.session_state.g_scan_mode
+            st.markdown(f"**NSE Potential {mode}s:**")
+            if not st.session_state.g_scan_results:
+                st.info("No strong candidates found.")
+            else:
+                for res in st.session_state.g_scan_results:
+                    st.write(f"• **{res['Symbol']}**: {res['Prob']} ({res['Signal']})")
 
     avail_tfs  = list(TF_CRYPTO.keys()) if not is_india else list(TF_INDIA.keys())
     timeframes = st.multiselect(

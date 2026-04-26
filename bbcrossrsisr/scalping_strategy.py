@@ -592,6 +592,40 @@ def fetch_groww_ohlcv(symbol: str, exchange: str, tf_key: str,
         logger.error(error_msg)
         raise ValueError(error_msg)
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_pcr_groww(symbol: str, exchange: str, api_token: str) -> dict:
+    """Fetch Put-Call Ratio for the nearest expiry of the given symbol."""
+    if not api_token: return None
+    headers = {"Authorization": f"Bearer {api_token.strip()}", "Accept": "application/json"}
+    
+    try:
+        exp_url = f"{GROWW_BASE}/v1/historical/expiries"
+        exp_res = requests.get(exp_url, headers=headers, params={"exchange": exchange, "underlying_symbol": symbol}, timeout=5)
+        if exp_res.status_code != 200: return None
+        exp_data = exp_res.json()
+        if not exp_data.get("expiryDates"): return None
+        
+        nearest_expiry = min(exp_data["expiryDates"])
+        
+        oc_url = f"{GROWW_BASE}/v1/option-chain/exchange/{exchange}/underlying/{symbol}"
+        oc_res = requests.get(oc_url, headers=headers, params={"expiry_date": nearest_expiry}, timeout=5)
+        if oc_res.status_code != 200: return None
+        oc_data = oc_res.json()
+        
+        strikes = oc_data.get("strikes", {})
+        total_pe_oi = 0
+        total_ce_oi = 0
+        
+        for strike, data in strikes.items():
+            if "PE" in data: total_pe_oi += data["PE"].get("open_interest", 0)
+            if "CE" in data: total_ce_oi += data["CE"].get("open_interest", 0)
+            
+        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
+        status = "BULLISH" if pcr >= 1.0 else "BEARISH" if pcr <= 0.8 else "NEUTRAL"
+        return {"pcr": pcr, "status": status, "pe_oi": total_pe_oi, "ce_oi": total_ce_oi, "expiry": nearest_expiry}
+    except Exception as e:
+        logger.error(f"Error fetching PCR for {symbol}: {e}")
+        return None
 
 def _parse_groww_candles(candles: list) -> pd.DataFrame:
     """Normalise Groww candle arrays → clean DataFrame."""
@@ -760,69 +794,86 @@ def get_coindcx_gainers():
 def analyze_pump_dump_candidates(mode="PUMP"):
     """
     Deep scan of CoinDCX tickers to find 'Pump' or 'Dump' candidates.
-    mode: 'PUMP' or 'DUMP'
+    Uses multi-factor scoring: volume, trend, momentum, patterns, S/R.
     """
     try:
-        # Fetch current prices to get all symbols
         url_rt = "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
         resp_rt = requests.get(url_rt, timeout=10).json()
         prices = resp_rt.get("prices", {})
         
-        # Sort by 24h gain and scan top 30 to keep it fast
+        # Sort by 24h gain for PUMP, loss for DUMP; scan top 30
         tickers = sorted(prices.keys(), key=lambda x: prices[x].get("pc", 0), reverse=(mode=="PUMP"))[:30]
         
         candidates = []
         for symbol in tickers:
             try:
-                # Fetch context
-                df = fetch_coindcx_ohlcv(symbol, "1h", limit=24) # 24h
-                df_5m = fetch_coindcx_ohlcv(symbol, "5m", limit=24) # 2h
+                df_1h = fetch_coindcx_ohlcv(symbol, "1h", limit=24)  # 24h context
+                df_5m = fetch_coindcx_ohlcv(symbol, "5m", limit=24)  # ~2h recent
                 
                 if df_5m.empty or len(df_5m) < 20: continue
+                if df_1h.empty or len(df_1h) < 10: continue
                 
                 price = df_5m.iloc[-1]['close']
-                # Volume surging check
+                
+                # Volume: recent 2h vs full 24h baseline
                 vol_recent = df_5m['volume'].mean()
-                vol_24h = df['volume'].mean()
+                vol_24h = df_1h['volume'].mean()
                 v_surge = vol_recent / vol_24h if vol_24h > 0 else 1.0
                 
+                # Volume acceleration (last 5 candles trend)
+                vol_accel = df_5m['volume'].iloc[-5:].mean() / (df_5m['volume'].iloc[-10:-5].mean() + 1e-9)
+                
+                # Indicators
                 st_sig, _ = supertrend(df_5m)
                 vw = vwap(df_5m)
-                rsi_val = rsi(df_5m['close']).iloc[-1]
+                rsi_series = rsi(df_5m['close'])
+                rsi_now = rsi_series.iloc[-1]
+                rsi_prev = rsi_series.iloc[-3] if len(rsi_series) >= 3 else rsi_now
+                rsi_rising = rsi_now > rsi_prev  # RSI direction
+                
                 bull_p, bear_p = detect_patterns(df_5m)
                 
-                # S/R context
-                sh, sl = df_5m['high'].max(), df_5m['low'].min()
-                breakout = price > sh * 0.998
-                breakdown = price < sl * 1.002
+                # S/R context over full 24h range
+                swing_highs_24h, swing_lows_24h = pivot_levels(df_1h, lookback=5)
+                res_24h = [v for _, v in swing_highs_24h if v > price * 0.995]
+                sup_24h = [v for _, v in swing_lows_24h if v < price * 1.005]
+                breakout_24h = bool(res_24h) and price > min(res_24h) * 0.998
+                breakdown_24h = bool(sup_24h) and price < max(sup_24h) * 1.002
                 
-                prob = 40 # Base prob
+                prob = 35  # Base
                 reasons = []
                 
                 if mode == "PUMP":
-                    if v_surge > 1.3: prob += 15; reasons.append(f"Vol Surge {v_surge:.1f}x")
-                    if st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bullish")
-                    if price > vw.iloc[-1]: prob += 10; reasons.append("Above VWAP")
-                    if rsi_val > 65: prob += 10; reasons.append("Strong Momentum")
-                    if bull_p: prob += 15; reasons.append("Bull Patterns")
-                    if breakout: prob += 10; reasons.append("Resistance Breakout")
-                    if bear_p: prob -= 20
-                else: # DUMP
-                    if v_surge > 1.3: prob += 15; reasons.append(f"Heavy Volume {v_surge:.1f}x")
+                    if v_surge > 1.3:    prob += 15; reasons.append(f"Vol Surge {v_surge:.1f}x vs 24h")
+                    if vol_accel > 1.5:  prob += 8;  reasons.append(f"Vol Accelerating {vol_accel:.1f}x")
+                    if st_sig.iloc[-1]:  prob += 10; reasons.append("Supertrend Bullish")
+                    if price > vw.iloc[-1]: prob += 8; reasons.append("Above VWAP")
+                    if rsi_now > 55 and rsi_rising:  prob += 10; reasons.append(f"RSI Rising ({rsi_now:.0f})")
+                    if rsi_now > 70:     prob += 5;  reasons.append(f"Strong Momentum RSI {rsi_now:.0f}")
+                    if bull_p:           prob += min(len(bull_p) * 8, 15); reasons.append(f"{', '.join(bull_p[:2])}")
+                    if breakout_24h:     prob += 12; reasons.append("24h Resistance Breakout")
+                    if bear_p:           prob -= 15
+                    if rsi_now > 80:     prob -= 10  # Overbought risk
+                else:  # DUMP
+                    if v_surge > 1.3:    prob += 15; reasons.append(f"Heavy Vol {v_surge:.1f}x vs 24h")
+                    if vol_accel > 1.5:  prob += 8;  reasons.append(f"Vol Accelerating {vol_accel:.1f}x")
                     if not st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bearish")
-                    if price < vw.iloc[-1]: prob += 10; reasons.append("Below VWAP")
-                    if rsi_val < 35: prob += 10; reasons.append("Weak Momentum")
-                    if bear_p: prob += 15; reasons.append("Bear Patterns")
-                    if breakdown: prob += 10; reasons.append("Support Breakdown")
-                    if bull_p: prob -= 20
+                    if price < vw.iloc[-1]: prob += 8; reasons.append("Below VWAP")
+                    if rsi_now < 45 and not rsi_rising: prob += 10; reasons.append(f"RSI Falling ({rsi_now:.0f})")
+                    if rsi_now < 30:     prob += 5;  reasons.append(f"Weak Momentum RSI {rsi_now:.0f}")
+                    if bear_p:           prob += min(len(bear_p) * 8, 15); reasons.append(f"{', '.join(bear_p[:2])}")
+                    if breakdown_24h:    prob += 12; reasons.append("24h Support Breakdown")
+                    if bull_p:           prob -= 15
+                    if rsi_now < 20:     prob -= 8   # Oversold bounce risk
                 
-                prob = max(10, min(98, prob))
-                if prob >= 65:
+                prob = max(10, min(97, prob))
+                if prob >= 62:
                     display_name = symbol.replace("B-", "").replace("_", "")
+                    top_reasons = " | ".join(reasons[:3]) if reasons else "Multiple Factors"
                     candidates.append({
                         "Symbol": display_name,
                         "Prob": f"{prob}%",
-                        "Signal": reasons[0] if reasons else "Multiple Factors",
+                        "Signal": top_reasons,
                         "Score": prob
                     })
             except: continue
@@ -834,6 +885,7 @@ def analyze_pump_dump_candidates(mode="PUMP"):
 def analyze_groww_pump_dump_candidates(token, exchange="NSE", mode="PUMP", ticker_list=NIFTY_50):
     """
     Scan top Indian stocks for Pump/Dump potential.
+    Multi-factor scoring: volume, trend, RSI direction, patterns, S/R.
     """
     if not token:
         return [{"Symbol": "TOKEN MISSING", "Prob": "0%", "Signal": "Enter Groww Token", "Score": 0}]
@@ -842,46 +894,72 @@ def analyze_groww_pump_dump_candidates(token, exchange="NSE", mode="PUMP", ticke
     # Scan first 30 for speed
     for symbol in ticker_list[:30]:
         try:
-            # Fetch context
-            df = fetch_groww_ohlcv(symbol, exchange, "1h", token, limit=24) # 24h
-            df_5m = fetch_groww_ohlcv(symbol, exchange, "5m", token, limit=24) # 2h
+            df_1h = fetch_groww_ohlcv(symbol, exchange, "1h", token, limit=24)  # 24h
+            df_5m = fetch_groww_ohlcv(symbol, exchange, "5m", token, limit=24)  # ~2h
             
             if df_5m.empty or len(df_5m) < 20: continue
+            if df_1h.empty or len(df_1h) < 8: continue
             
             price = df_5m.iloc[-1]['close']
+            
+            # Volume: recent vs 24h baseline
             vol_recent = df_5m['volume'].mean()
-            vol_24h = df['volume'].mean()
+            vol_24h = df_1h['volume'].mean() if not df_1h.empty else vol_recent
             v_surge = vol_recent / vol_24h if vol_24h > 0 else 1.0
             
+            # Volume acceleration (momentum of volume itself)
+            vol_accel = df_5m['volume'].iloc[-5:].mean() / (df_5m['volume'].iloc[-10:-5].mean() + 1e-9)
+            
+            # Indicators
             st_sig, _ = supertrend(df_5m)
             vw = vwap(df_5m)
-            rsi_val = rsi(df_5m['close']).iloc[-1]
+            rsi_series = rsi(df_5m['close'])
+            rsi_now = rsi_series.iloc[-1]
+            rsi_prev = rsi_series.iloc[-3] if len(rsi_series) >= 3 else rsi_now
+            rsi_rising = rsi_now > rsi_prev
+            
             bull_p, bear_p = detect_patterns(df_5m)
             
-            prob = 35 # Base
+            # 24h S/R context
+            swing_highs_24h, swing_lows_24h = pivot_levels(df_1h, lookback=5) if len(df_1h) >= 10 else ([], [])
+            res_24h = [v for _, v in swing_highs_24h if v > price * 0.995]
+            sup_24h = [v for _, v in swing_lows_24h if v < price * 1.005]
+            breakout_24h = bool(res_24h) and price > min(res_24h) * 0.998
+            breakdown_24h = bool(sup_24h) and price < max(sup_24h) * 1.002
+            
+            prob = 35  # Base
             reasons = []
             
             if mode == "PUMP":
-                if v_surge > 1.2: prob += 15; reasons.append(f"Vol Surge {v_surge:.1f}x")
-                if st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bullish")
-                if price > vw.iloc[-1]: prob += 10; reasons.append("Above VWAP")
-                if bull_p: prob += 15; reasons.append("Bull Patterns")
-                if rsi_val > 60: prob += 10; reasons.append("Momentum")
-                if bear_p: prob -= 20
-            else: # DUMP
-                if v_surge > 1.2: prob += 15; reasons.append(f"Heavy Volume {v_surge:.1f}x")
+                if v_surge > 1.2:    prob += 14; reasons.append(f"Vol Surge {v_surge:.1f}x")
+                if vol_accel > 1.4:  prob += 7;  reasons.append(f"Vol Accelerating {vol_accel:.1f}x")
+                if st_sig.iloc[-1]:  prob += 10; reasons.append("Supertrend Bullish")
+                if price > vw.iloc[-1]: prob += 8; reasons.append("Above VWAP")
+                if rsi_now > 55 and rsi_rising: prob += 10; reasons.append(f"RSI Rising ({rsi_now:.0f})")
+                if rsi_now > 70:     prob += 5;  reasons.append(f"Strong Momentum")
+                if bull_p:           prob += min(len(bull_p) * 8, 15); reasons.append(f"{', '.join(bull_p[:2])}")
+                if breakout_24h:     prob += 12; reasons.append("24h Breakout")
+                if bear_p:           prob -= 15
+                if rsi_now > 82:     prob -= 10  # Overbought
+            else:  # DUMP
+                if v_surge > 1.2:    prob += 14; reasons.append(f"Heavy Vol {v_surge:.1f}x")
+                if vol_accel > 1.4:  prob += 7;  reasons.append(f"Vol Accelerating {vol_accel:.1f}x")
                 if not st_sig.iloc[-1]: prob += 10; reasons.append("Supertrend Bearish")
-                if price < vw.iloc[-1]: prob += 10; reasons.append("Below VWAP")
-                if bear_p: prob += 15; reasons.append("Bear Patterns")
-                if rsi_val < 40: prob += 10; reasons.append("Weakness")
-                if bull_p: prob -= 20
+                if price < vw.iloc[-1]: prob += 8; reasons.append("Below VWAP")
+                if rsi_now < 45 and not rsi_rising: prob += 10; reasons.append(f"RSI Falling ({rsi_now:.0f})")
+                if rsi_now < 30:     prob += 5;  reasons.append("Oversold Momentum")
+                if bear_p:           prob += min(len(bear_p) * 8, 15); reasons.append(f"{', '.join(bear_p[:2])}")
+                if breakdown_24h:    prob += 12; reasons.append("24h Breakdown")
+                if bull_p:           prob -= 15
+                if rsi_now < 18:     prob -= 8   # Bounce risk
                 
             prob = max(10, min(95, prob))
-            if prob >= 60:
+            if prob >= 58:
+                top_reasons = " | ".join(reasons[:3]) if reasons else "Multiple Factors"
                 candidates.append({
                     "Symbol": symbol,
                     "Prob": f"{prob}%",
-                    "Signal": reasons[0] if reasons else "Multiple Factors",
+                    "Signal": top_reasons,
                     "Score": prob
                 })
         except: continue
@@ -1009,7 +1087,7 @@ def fibonacci_levels(sh, sl):
     d = sh - sl
     return {f"{int(r*100)}%": sh - d * r for r in [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]}
 
-def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currency: str = "₹") -> dict:
+def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currency: str = "₹", pcr_data: dict = None) -> dict:
     result = {"symbol": symbol, "tf": tf, "error": None, "currency": currency}
 
     try:
@@ -1237,36 +1315,79 @@ def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currenc
         # ── Strategy Engine (Final Recommendation) ────────────────────────
         score = 0
         
-        # Trend (Supertrend & VWAP)
+        # ── 1. Primary Trend: EMA200 (strongest signal, weight +3/-3) ──────
+        trend_200 = result.get("trend_200", "BEARISH")
+        if trend_200 == "BULLISH":
+            score += 3
+        else:
+            score -= 3
+        
+        # ── 2. Supertrend & VWAP (weight +2/-2 each) ─────────────────────
         if result["supertrend"] == "BULLISH": score += 2
         else: score -= 2
         
         if result["vwap"] == "BULLISH": score += 2
         else: score -= 2
         
-        # Momentum (RSI & EMA)
-        if rsi_val < 40: score += 1 # Potential reversal up
-        elif rsi_val > 60: score -= 1 # Potential reversal down
+        # ── 3. RSI — Momentum Continuation (not reversal) ────────────────
+        # RSI 50-70 = healthy bull momentum, >70 = overbought risk, <30 = oversold risk
+        rsi_dir_ok = False  # RSI pointing in right direction
+        if rsi_val >= 55 and rsi_val < 75:  # Strong bull momentum
+            score += 2
+            rsi_dir_ok = True
+        elif rsi_val <= 45 and rsi_val > 25:  # Strong bear momentum
+            score -= 2
+            rsi_dir_ok = True
+        elif rsi_val >= 75:  # Overbought – caution, slight negative
+            score -= 1
+        elif rsi_val <= 25:  # Oversold – caution, slight positive
+            score += 1
         
+        # ── 4. EMA Crossovers (weight +2/-2) ─────────────────────────────
         if any(e["pending_cross"] == "BULLISH" or e["bull_cross_now"] for e in ema_signals): score += 2
         if any(e["pending_cross"] == "BEARISH" or e["bear_cross_now"] for e in ema_signals): score -= 2
         
-        # Price Action (S/R & BB)
-        if sr_event == "BREAKOUT": score += 2
-        elif sr_event == "BREAKDOWN": score -= 2
+        # ── 5. Price Action: S/R breakout WITH volume confirmation ────────
+        vol_ratio = result.get("volume_ratio", 1.0)
+        vol_confirmed = vol_ratio > 1.2  # 20% above average = confirmation
         
+        if sr_event == "BREAKOUT":
+            score += 3 if vol_confirmed else 2
+        elif sr_event == "BREAKDOWN":
+            score -= 3 if vol_confirmed else 2
+        
+        # ── 6. Bollinger Bands (weight +1/-1) ────────────────────────────
         if bb_pos == "TOUCHED_LOWER": score += 1
         elif bb_pos == "TOUCHED_UPPER": score -= 1
         
-        # Patterns
-        score += len(bull_p) * 2
-        score -= len(bear_p) * 2
+        # ── 7. Fibonacci zone bonus ───────────────────────────────────────
+        # Golden ratio zones (0.382 / 0.618) are high-probability reversal points
+        fib_zone = result.get("fib_current_zone", "")
+        fib_bias = result.get("fib_bias", "NEUTRAL")
+        if fib_zone in ("38.2%", "61.8%"):
+            if fib_bias == "BULLISH": score += 1
+            elif fib_bias == "BEARISH": score -= 1
+        
+        # ── 8. Volume trend bonus (increasing volume is conviction) ───────
+        vol_trend = result.get("volume_trend", "STABLE")
+        if vol_trend == "INCREASING" and trend_200 == "BULLISH": score += 1
+        elif vol_trend == "INCREASING" and trend_200 == "BEARISH": score -= 1
+        
+        # ── 9. Patterns (capped at +3/-3 to prevent runaway scores) ───────
+        bull_score = min(len(bull_p) * 2, 4)
+        bear_score = min(len(bear_p) * 2, 4)
+        score += bull_score
+        score -= bear_score
         
         # Final Signal
         final_signal = "WAIT"
         sl_pct = 0.0
         tp_pct = 0.0
         
+        if pcr_data:
+            if pcr_data["status"] == "BULLISH": score += 2
+            elif pcr_data["status"] == "BEARISH": score -= 2
+            
         if score >= 5:
             final_signal = "BUY"
             # SL below Support or Lower BB
@@ -1286,7 +1407,8 @@ def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currenc
             "strategy_signal": final_signal,
             "strategy_score": score,
             "strategy_sl": round(sl_pct, 2),
-            "strategy_tp": round(tp_pct, 2)
+            "strategy_tp": round(tp_pct, 2),
+            "pcr_data": pcr_data
         })
 
         logger.info(f"✅ Successfully analysed {symbol} [{tf}] | Signal: {final_signal} (Score: {score})")
@@ -1330,7 +1452,17 @@ def render_tf_analysis(r: dict, is_india: bool = False):
                 <div style="background:rgba(255,255,255,0.03); padding:15px; border-radius:10px; border-left:5px solid {('#00ff88' if sk=='bull' else '#ff4b4b' if sk=='bear' else '#6b7280')};">
                     <div style="color:#6b7280; font-size:12px; text-transform:uppercase; letter-spacing:1px;">Smart Recommendation</div>
                     <div style="font-size:28px; font-weight:bold; margin:5px 0;">{si} {r['strategy_signal']}</div>
-                    <div style="color:#6b7280; font-size:12px;">Strategy Score: <span style="color:{('#00ff88' if r['strategy_score']>0 else '#ff4b4b' if r['strategy_score']<0 else '#6b7280')}">{r['strategy_score']}</span></div>
+                    <div style="color:#6b7280; font-size:12px;">Strategy Score: <span style="color:{('#00ff88' if r['strategy_score']>0 else '#ff4b4b' if r['strategy_score']<0 else '#6b7280')}; font-size:16px; font-weight:bold;">{r['strategy_score']:+d}</span> <span style="color:#4b5563; font-size:10px;">(range ≈ -22 to +22)</span></div>
+                    <div style="margin:6px 0 4px 0; background:#1f2937; border-radius:4px; height:6px; width:100%; overflow:hidden;">
+                        <div style="height:6px; width:{min(100, max(0, (r['strategy_score']+22)/44*100)):.0f}%; background:{'#00ff88' if r['strategy_score']>=5 else '#f97316' if r['strategy_score']>0 else '#ff4b4b' if r['strategy_score']<=-5 else '#ef4444' if r['strategy_score']<0 else '#6b7280'}; border-radius:4px; transition:width 0.3s;"></div>
+                    </div>
+                    <div style="margin-top:4px; font-size:9px; color:#374151; display:flex; gap:8px;">
+                        <span style="color:#ff4b4b">■ ≤-8 Strong SELL</span>
+                        <span style="color:#f97316">■ -7 to -3 Lean Bear</span>
+                        <span style="color:#6b7280">■ -2 to +2 WAIT</span>
+                        <span style="color:#22c55e">■ +3 to +7 Lean Bull</span>
+                        <span style="color:#00ff88">■ ≥+8 Strong BUY</span>
+                    </div>
                 </div>
             """, unsafe_allow_html=True)
         
@@ -1446,9 +1578,9 @@ def render_tf_analysis(r: dict, is_india: bool = False):
         fh  += '</span>'
         st.markdown(render_metric("FIBONACCI RETRACEMENT", fh), unsafe_allow_html=True)
 
-    # ── Col 4: Patterns ───────────────────────────────────────────────
+    # ── Col 4: Patterns & PCR ───────────────────────────────────────────────
     st.markdown('<hr style="border-color:rgba(255,255,255,0.05); margin:8px 0;">', unsafe_allow_html=True)
-    cols_p = st.columns(1)
+    cols_p = st.columns(2)
     with cols_p[0]:
         ph = ""
         if r["patterns_bull"]:
@@ -1460,6 +1592,22 @@ def render_tf_analysis(r: dict, is_india: bool = False):
             ph = '<span style="color:#6b7280">No significant patterns detected in recent candles.</span>'
         
         st.markdown(render_metric("CHART & CANDLESTICK PATTERNS", ph), unsafe_allow_html=True)
+        
+    with cols_p[1]:
+        if r.get("pcr_data"):
+            pcr = r["pcr_data"]
+            pk = "bull" if pcr["status"] == "BULLISH" else "bear" if pcr["status"] == "BEARISH" else "neu"
+            ph2 = f'PCR: <b>{pcr["pcr"]}</b> {pill(pcr["status"], pk)}<br>'
+            ph2 += f'<span style="font-size:10px;color:#aaa">PE OI: {pcr["pe_oi"]:,} | CE OI: {pcr["ce_oi"]:,}<br>Expiry: {pcr["expiry"]}</span>'
+            ph2 += f'<br><span style="font-size:10px;color:#6b7280">PCR &gt; 1.0 = Bullish&nbsp; PCR 0.8-1.0 = Neutral&nbsp; PCR &lt; 0.8 = Bearish</span>'
+        else:
+            ph2 = '<span style="color:#6b7280; font-size:11px;">'
+            ph2 += 'PCR not available.<br>'
+            ph2 += 'Requires Groww FNO subscription.<br>'
+            ph2 += 'PCR &gt; 1.0 = Bullish (Put writers covering) <br>'
+            ph2 += 'PCR 0.8–1.0 = Neutral<br>'
+            ph2 += 'PCR &lt; 0.8 = Bearish (Call writers covering)</span>'
+        st.markdown(render_metric("OPTIONS (PUT-CALL RATIO)", ph2), unsafe_allow_html=True)
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -1644,7 +1792,11 @@ if run_btn or auto_refresh:
                             st.warning(f"No data for {ticker} [{tf}]")
                             continue
                         
-                        result = analyse(df, ticker, tf, ema_pairs=ema_pairs, currency=currency)
+                        pcr_data = None
+                        if market == "Groww (India Stocks)":
+                            pcr_data = fetch_pcr_groww(ticker, groww_exchange, groww_token)
+                        
+                        result = analyse(df, ticker, tf, ema_pairs=ema_pairs, currency=currency, pcr_data=pcr_data)
                         
                         if result.get("error"):
                             logger.warning(f"Analysis error for {ticker} [{tf}]: {result['error']}")

@@ -222,8 +222,10 @@ TF_INDIA = {
     "1m":  (1,    7,    60),
     "5m":  (5,    15,   300),
     "10m": (10,   30,   600),
+    "15m": (15,   60,   900),
+    "30m": (30,   90,   1800),
     "1h":  (60,   150,  3600),
-    "4h":  (240,  365,  14400),
+    "4h":  (240,  300,  14400),
     "1d":  (1440, 1080, 86400),
 }
 
@@ -528,7 +530,29 @@ def fetch_groww_ohlcv(symbol: str, exchange: str, tf_key: str,
             error_msg = f"Request timeout from Groww API (legacy endpoint): {str(e)}"
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+            
+        except requests.exceptions.RequestException as e:
+            # Fallback for 4h if it fails with 400 or other request errors
+            if tf_key == "4h":
+                logger.warning(f"Native 4h fetch failed for {symbol}. Attempting 1h-to-4h resampling...")
+                try:
+                    df_1h = fetch_groww_ohlcv(symbol, "1h", limit * 4, exchange, api_token)
+                    if not df_1h.empty:
+                        df_1h['time_dt'] = pd.to_datetime(df_1h['time'], unit='s')
+                        df_1h.set_index('time_dt', inplace=True)
+                        resampled = df_1h.resample('4H').agg({
+                            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                        }).dropna()
+                        resampled.reset_index(inplace=True)
+                        resampled['time'] = resampled['time_dt'].view('int64') // 10**9
+                        logger.info(f"✅ Successfully resampled 1h to 4h for {symbol} ({len(resampled)} candles)")
+                        return resampled
+                except: pass
+            
+            error_msg = f"Groww API Request Error: {str(e)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+            
         except requests.exceptions.ConnectionError as e:
             error_msg = f"Connection error to Groww API: {str(e)}"
             logger.error(error_msg)
@@ -839,11 +863,19 @@ def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currenc
             result["error"] = error_msg
             return result
 
-        if len(df) < 220:
-            error_msg = f"Only {len(df)} candles fetched (need ≥220)."
+        # Dynamic minimum candles based on EMA pairs (e.g. 50/200 needs >200)
+        max_ema = max([p[1] for p in ema_pairs]) if ema_pairs else 20
+        min_ideal = max_ema + 10
+        
+        if len(df) < 50:
+            error_msg = f"Insufficient data: Only {len(df)} candles fetched (need ≥50)."
             logger.warning(error_msg)
             result["error"] = error_msg
             return result
+        
+        if len(df) < min_ideal:
+            st.warning(f"⚠️ **Limited Data**: Only {len(df)} candles fetched for {symbol} {tf}. "
+                       f"Indicators like {max_ema} EMA may be less accurate (ideal ≥{min_ideal}).")
 
         close  = df["close"]
         high   = df["high"]

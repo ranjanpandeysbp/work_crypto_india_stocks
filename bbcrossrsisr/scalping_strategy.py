@@ -596,9 +596,171 @@ def _parse_groww_candles(candles: list) -> pd.DataFrame:
         return df
         
     except Exception as e:
-        error_msg = f"Error parsing Groww candles: {str(e)}"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+        logger.error(f"Unexpected error fetching Groww candles: {str(e)}")
+        raise ValueError(f"Groww error: {str(e)}")
+
+def detect_patterns(df):
+    """
+    Detect common candlestick and chart patterns.
+    Returns: (list of bullish patterns, list of bearish patterns)
+    """
+    bullish = []
+    bearish = []
+    
+    if len(df) < 5:
+        return bullish, bearish
+        
+    c = df.iloc[-1]
+    p = df.iloc[-2]
+    p2 = df.iloc[-3]
+    
+    # 1. Candlestick Patterns
+    body = abs(c['close'] - c['open'])
+    p_body = abs(p['close'] - p['open'])
+    range_val = c['high'] - c['low']
+    upper_wick = c['high'] - max(c['close'], c['open'])
+    lower_wick = min(c['close'], c['open']) - c['low']
+    
+    # Doji
+    if body < (range_val * 0.1) and range_val > 0:
+        bullish.append("Doji (Indecision)")
+        
+    # Hammer (Bullish)
+    if lower_wick > (2 * body) and upper_wick < (0.2 * body) and body > 0:
+        bullish.append("Hammer (Bullish Reversal)")
+        
+    # Shooting Star (Bearish)
+    if upper_wick > (2 * body) and lower_wick < (0.2 * body) and body > 0:
+        bearish.append("Shooting Star (Bearish Reversal)")
+        
+    # Bullish Engulfing
+    if p['close'] < p['open'] and c['close'] > c['open'] and \
+       c['close'] >= p['open'] and c['open'] <= p['close']:
+        bullish.append("Bullish Engulfing")
+        
+    # Bearish Engulfing
+    if p['close'] > p['open'] and c['close'] < c['open'] and \
+       c['close'] <= p['open'] and c['open'] >= p['close']:
+        bearish.append("Bearish Engulfing")
+
+    # Morning Star (Bullish)
+    if p2['close'] < p2['open'] and p_body < (abs(p2['close']-p2['open'])*0.3) and \
+       c['close'] > c['open'] and c['close'] > (p2['open'] + p2['close'])/2:
+        bullish.append("Morning Star")
+        
+    # Evening Star (Bearish)
+    if p2['close'] > p2['open'] and p_body < (abs(p2['close']-p2['open'])*0.3) and \
+       c['close'] < c['open'] and c['close'] < (p2['open'] + p2['close'])/2:
+        bearish.append("Evening Star")
+
+    # 2. Simple Chart Patterns (using last 20 candles)
+    recent = df.iloc[-20:]
+    highs = recent['high'].values
+    lows = recent['low'].values
+    
+    # Double Bottom (simplified)
+    # Find two local lows within 2% of each other
+    if len(lows) >= 10:
+        l1, l2 = sorted(lows)[:2]
+        if abs(l1 - l2) / l1 < 0.005 and c['close'] > (l1 * 1.01):
+            bullish.append("Double Bottom (Potential)")
+            
+    # Double Top (simplified)
+    if len(highs) >= 10:
+        h1, h2 = sorted(highs, reverse=True)[:2]
+        if abs(h1 - h2) / h1 < 0.005 and c['close'] < (h1 * 0.99):
+            bearish.append("Double Top (Potential)")
+
+    return bullish, bearish
+
+@st.cache_data(ttl=30)
+def get_coindcx_gainers():
+    """Fetch and filter CoinDCX Futures gainers > 10%."""
+    try:
+        fetch_time = datetime.now().strftime("%H:%M:%S")
+        url = "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
+        resp = requests.get(url, timeout=10).json()
+        prices = resp.get("prices", {})
+        gainers = []
+        for sym, data in prices.items():
+            pc = data.get("pc", 0)
+            if pc > 10:
+                high_val = data.get("h", 0)
+                last_val = data.get("ls", 0)
+                
+                # Calculate the 24h base price to find the high %
+                # pc = (last / base - 1) * 100  =>  base = last / (1 + pc/100)
+                if pc != -100 and last_val > 0:
+                    base_price = last_val / (1 + pc / 100)
+                    high_pc = ((high_val / base_price) - 1) * 100
+                else:
+                    high_pc = 0
+                
+                display_name = sym.replace("B-", "").replace("_", "")
+                gainers.append({
+                    "sym": sym, 
+                    "label": f"{display_name} (Gain: {pc:.1f}% | High: {high_pc:.1f}%)"
+                })
+        return sorted(gainers, key=lambda x: x["label"]), fetch_time
+    except Exception as e:
+        logger.error(f"Error fetching CoinDCX gainers: {e}")
+        return [], datetime.now().strftime("%H:%M:%S")
+
+def fetch_coindcx_ohlcv(symbol, resolution, limit=1000):
+    """
+    Fetch OHLCV data from CoinDCX Futures API.
+    Resolutions: '1', '5', '15', '60', '240', '1D'
+    """
+    url = "https://public.coindcx.com/market_data/candlesticks"
+    
+    # Map resolution
+    res_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1D"}
+    res = res_map.get(resolution, resolution)
+    
+    # Calculate time range
+    # 1000 candles * resolution in seconds
+    res_sec = 60 if res == "1" else 300 if res == "5" else 900 if res == "15" else 3600 if res == "60" else 14400 if res == "240" else 86400
+    lookback = limit * res_sec
+    end = int(time.time())
+    start = end - lookback
+    
+    params = {
+        "pair": symbol,
+        "from": start,
+        "to": end,
+        "resolution": res,
+        "pcode": "f"
+    }
+    
+    logger.info(f"Fetching CoinDCX Futures: {symbol} [{resolution}], limit={limit}")
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("s") != "ok":
+            raise ValueError(f"CoinDCX API error: {data.get('message', 'Unknown error')}")
+            
+        candles = data.get("data", [])
+        if not candles:
+            return pd.DataFrame()
+            
+        rows = []
+        for c in candles:
+            rows.append({
+                "time": int(c["time"] / 1000), # Convert ms to s
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c["volume"])
+            })
+            
+        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        return df
+    except Exception as e:
+        logger.error(f"Error fetching CoinDCX candles: {str(e)}")
+        return pd.DataFrame()
 
 # ─── Technical Indicators ────────────────────────────────────────────────────
 
@@ -865,7 +1027,80 @@ def analyse(df: pd.DataFrame, symbol: str, tf: str, ema_pairs=[(9, 21)], currenc
                 "fib_swing_low": 0, "price": round(price, 4),
             })
 
-        logger.info(f"✅ Successfully analysed {symbol} [{tf}]")
+        # ── Patterns ──────────────────────────────────────────────────────
+        bull_p, bear_p = detect_patterns(df)
+        result["patterns_bull"] = bull_p
+        result["patterns_bear"] = bear_p
+
+        # 7. Bias Determination
+        fib_pivot = result.get("fib_levels", {}).get("50%", 0)
+        if fib_pivot > 0:
+            dist_50 = abs(price - fib_pivot) / fib_pivot
+            if dist_50 < 0.005:
+                result["fib_bias"] = "NEUTRAL"
+            elif price > fib_pivot:
+                result["fib_bias"] = "BULLISH"
+            else:
+                result["fib_bias"] = "BEARISH"
+        else:
+            result["fib_bias"] = "NEUTRAL"
+
+        # ── Strategy Engine (Final Recommendation) ────────────────────────
+        score = 0
+        
+        # Trend (Supertrend & VWAP)
+        if result["supertrend"] == "BULLISH": score += 2
+        else: score -= 2
+        
+        if result["vwap"] == "BULLISH": score += 2
+        else: score -= 2
+        
+        # Momentum (RSI & EMA)
+        if rsi_val < 40: score += 1 # Potential reversal up
+        elif rsi_val > 60: score -= 1 # Potential reversal down
+        
+        if any(e["pending_cross"] == "BULLISH" or e["bull_cross_now"] for e in ema_signals): score += 2
+        if any(e["pending_cross"] == "BEARISH" or e["bear_cross_now"] for e in ema_signals): score -= 2
+        
+        # Price Action (S/R & BB)
+        if sr_event == "BREAKOUT": score += 2
+        elif sr_event == "BREAKDOWN": score -= 2
+        
+        if bb_pos == "TOUCHED_LOWER": score += 1
+        elif bb_pos == "TOUCHED_UPPER": score -= 1
+        
+        # Patterns
+        score += len(bull_p) * 2
+        score -= len(bear_p) * 2
+        
+        # Final Signal
+        final_signal = "WAIT"
+        sl_pct = 0.0
+        tp_pct = 0.0
+        
+        if score >= 5:
+            final_signal = "BUY"
+            # SL below Support or Lower BB
+            sl_price = min(nearest_sup if nearest_sup else price*0.98, bb_lower) * 0.995
+            tp_price = max(nearest_res if nearest_res else price*1.05, bb_upper) * 1.005
+            sl_pct = abs(price - sl_price) / price * 100
+            tp_pct = abs(price - tp_price) / price * 100
+        elif score <= -5:
+            final_signal = "SELL"
+            # SL above Resistance or Upper BB
+            sl_price = max(nearest_res if nearest_res else price*1.02, bb_upper) * 1.005
+            tp_price = min(nearest_sup if nearest_sup else price*0.95, bb_lower) * 0.995
+            sl_pct = abs(price - sl_price) / price * 100
+            tp_pct = abs(price - tp_price) / price * 100
+
+        result.update({
+            "strategy_signal": final_signal,
+            "strategy_score": score,
+            "strategy_sl": round(sl_pct, 2),
+            "strategy_tp": round(tp_pct, 2)
+        })
+
+        logger.info(f"✅ Successfully analysed {symbol} [{tf}] | Signal: {final_signal} (Score: {score})")
         return result
 
     except Exception as e:
@@ -894,6 +1129,43 @@ def render_tf_analysis(r: dict, is_india: bool = False):
 
     price = r["price"]
     cur   = r.get("currency", "₹")
+    
+    # ── Header: Smart Recommendation ──────────────────────────────────
+    sk = {"BUY": "bull", "SELL": "bear", "WAIT": "neu"}.get(r["strategy_signal"], "neu")
+    si = {"BUY": "🚀", "SELL": "📉", "WAIT": "⚖️"}.get(r["strategy_signal"], "⚖️")
+    
+    with st.container():
+        sc1, sc2, sc3 = st.columns([2, 1, 1])
+        with sc1:
+            st.markdown(f"""
+                <div style="background:rgba(255,255,255,0.03); padding:15px; border-radius:10px; border-left:5px solid {('#00ff88' if sk=='bull' else '#ff4b4b' if sk=='bear' else '#6b7280')};">
+                    <div style="color:#6b7280; font-size:12px; text-transform:uppercase; letter-spacing:1px;">Smart Recommendation</div>
+                    <div style="font-size:28px; font-weight:bold; margin:5px 0;">{si} {r['strategy_signal']}</div>
+                    <div style="color:#6b7280; font-size:12px;">Strategy Score: <span style="color:{('#00ff88' if r['strategy_score']>0 else '#ff4b4b' if r['strategy_score']<0 else '#6b7280')}">{r['strategy_score']}</span></div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        if r["strategy_signal"] != "WAIT":
+            with sc2:
+                st.markdown(f"""
+                    <div style="background:rgba(255,255,255,0.03); padding:15px; border-radius:10px; text-align:center;">
+                        <div style="color:#ff4b4b; font-size:12px; text-transform:uppercase;">Stop Loss (SL)</div>
+                        <div style="font-size:20px; font-weight:bold;">{r['strategy_sl']}%</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with sc3:
+                st.markdown(f"""
+                    <div style="background:rgba(255,255,255,0.03); padding:15px; border-radius:10px; text-align:center;">
+                        <div style="color:#00ff88; font-size:12px; text-transform:uppercase;">Take Profit (TP)</div>
+                        <div style="font-size:20px; font-weight:bold;">{r['strategy_tp']}%</div>
+                    </div>
+                """, unsafe_allow_html=True)
+        else:
+            with sc2:
+                st.info("Market is currently non-trending or showing mixed signals. Consolidation likely.")
+
+    st.markdown('<hr style="border-color:rgba(255,255,255,0.05); margin:15px 0;">', unsafe_allow_html=True)
+
     cols  = st.columns(3)
 
     # ── Col 1: EMA / Trend / RSI ─────────────────────────────────────
@@ -975,32 +1247,62 @@ def render_tf_analysis(r: dict, is_india: bool = False):
         fd_icon   = "▲" if ntgt_px > price else "▼"
         fd_text   = "UPWARD TARGET" if ntgt_px > price else "DOWNWARD TARGET"
         
-        fh   = f'📍 CURRENT ZONE: <b>{color_val(r["fib_current_zone"], "accent")}</b> Level<br>'
+        fk = "bull" if r["fib_bias"] == "BULLISH" else "bear" if r["fib_bias"] == "BEARISH" else "neu"
+        fh   = f'{pill(r["fib_bias"], fk)} | ZONE: <b>{color_val(r["fib_current_zone"], "accent")}</b><br>'
         fh  += f'🎯 {fd_text}: <b>{color_val(f"{ntgt_lbl} @ {cur}{ntgt_px}", "purple")}</b> {fd_icon}<br>'
-        fh  += f'<span style="font-size:10px;color:#6b7280">Distance to Target: {cur}{dist_to_tgt:.2f} ({dist_pct:.2f}%)</span><br>'
-        fh  += f'<span style="font-size:10px;color:#6b7280">Swing Range: {cur}{r["fib_swing_low"]} → {cur}{r["fib_swing_high"]}</span><br>'
+        fh  += f'<span style="font-size:10px;color:#6b7280">Distance: {cur}{dist_to_tgt:.2f} ({dist_pct:.2f}%)</span><br>'
+        fh  += f'<span style="font-size:10px;color:#6b7280">Range: {cur}{r["fib_swing_low"]} → {cur}{r["fib_swing_high"]}</span><br>'
         fh  += '<span style="font-size:10px;color:#6b7280; display:block; margin-top:4px; padding:4px; background:rgba(255,255,255,0.05); border-radius:4px;">'
         fh  += " | ".join([f"<b>{k}</b>:{cur}{v:.1f}" for k, v in r["fib_levels"].items()])
         fh  += '</span>'
         st.markdown(render_metric("FIBONACCI RETRACEMENT", fh), unsafe_allow_html=True)
+
+    # ── Col 4: Patterns ───────────────────────────────────────────────
+    st.markdown('<hr style="border-color:rgba(255,255,255,0.05); margin:8px 0;">', unsafe_allow_html=True)
+    cols_p = st.columns(1)
+    with cols_p[0]:
+        ph = ""
+        if r["patterns_bull"]:
+            ph += f'<div style="margin-bottom:4px;">🟢 <b>Bullish:</b> ' + ", ".join([f'<span style="color:#00ff88">{p}</span>' for p in r["patterns_bull"]]) + '</div>'
+        if r["patterns_bear"]:
+            ph += f'<div style="margin-bottom:4px;">🔴 <b>Bearish:</b> ' + ", ".join([f'<span style="color:#ff6b8a">{p}</span>' for p in r["patterns_bear"]]) + '</div>'
+        
+        if not ph:
+            ph = '<span style="color:#6b7280">No significant patterns detected in recent candles.</span>'
+        
+        st.markdown(render_metric("CHART & CANDLESTICK PATTERNS", ph), unsafe_allow_html=True)
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<h2 style="color:#00d4ff;font-family:Bebas Neue,sans-serif;letter-spacing:3px;">⚡ MTF SCALPER</h2>', unsafe_allow_html=True)
     st.markdown('<hr style="border-color:#252830;">', unsafe_allow_html=True)
 
-    market_mode = st.selectbox(
-        "🌐 MARKET",
-        options=["🪙 Crypto — Delta Exchange", "🇮🇳 Indian Stocks — Groww"],
-        index=0,
-        help="Choose the exchange / market to analyse",
-    )
-    is_india = "Groww" in market_mode
-
-    st.markdown('<hr style="border-color:#252830;">', unsafe_allow_html=True)
-
-    # ── Inputs vary by market ──────────────────────────────────────────
-    if is_india:
+    # Market Selection
+    market = st.selectbox("Market API", ["Delta Exchange (Crypto)", "Groww (India Stocks)", "CoinDCX Futures"], index=0)
+    
+    tickers_to_analyse = []
+    
+    if market == "Delta Exchange (Crypto)":
+        default_tickers = ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD"]
+        ticker_input = st.text_input("Tickers (comma separated)", value=",".join(default_tickers))
+        tickers_to_analyse = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+        is_india = False
+        currency = "$"
+    elif market == "CoinDCX Futures":
+        gainers, last_update = get_coindcx_gainers()
+        st.caption(f"⏱ Ticker list updated: {last_update} (30s cache)")
+        if not gainers:
+            st.warning("No tickers found with >10% gain in last 24h.")
+            selected_gainers = []
+        else:
+            selected_labels = st.multiselect("Select Gainers", [g["label"] for g in gainers])
+            selected_gainers = [g["sym"] for g in gainers if g["label"] in selected_labels]
+        
+        tickers_to_analyse = selected_gainers
+        is_india = False
+        currency = "$"
+    else:
+        # Groww
         st.markdown(
             '<div class="info-box">'
             '🔐 <b>Groww Trade API token required</b><br>'
@@ -1024,93 +1326,32 @@ with st.sidebar:
             value="RELIANCE,INFY,TCS",
             help="NSE/BSE trading symbols e.g. RELIANCE, INFY, NIFTY, HDFCBANK",
         )
-        avail_tfs   = list(TF_INDIA.keys())
-        default_tfs = ["5m", "1h", "1d"]
-        timeframes  = st.multiselect(
-            "TIMEFRAMES",
-            options=avail_tfs,
-            default=[t for t in default_tfs if t in avail_tfs],
-            help="Groww supports: 1m, 5m, 10m, 1h, 4h, 1d",
-        )
-        
-        ema_options = ["5/9", "9/21", "9/30", "20/50", "50/200"]
-        selected_ema_pairs = st.multiselect(
-            "EMA CROSSOVERS",
-            options=ema_options,
-            default=["9/21"],
-            help="Select one or more EMA pairs to analyze crossovers"
-        )
-        currency       = "₹"
-        cache_ttl_lbl  = "60 s"
-        data_src_label = "Groww Trade API"
-        src_color      = "#ff9500"
+        tickers_to_analyse = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+        is_india = True
+        currency = "₹"
 
-    else:  # Crypto
-        groww_token    = None
-        groww_exchange = None
-        currency       = "$"
-        tickers_input  = st.text_input(
-            "TICKERS (comma separated)",
-            value="BTCUSD,ETHUSD",
-            help="Delta Exchange perpetual symbols e.g. BTCUSD, ETHUSD, SOLUSD",
-        )
-        avail_tfs  = list(TF_CRYPTO.keys())
-        timeframes = st.multiselect(
-            "TIMEFRAMES",
-            options=avail_tfs,
-            default=["5m", "15m", "1h"],
-        )
-        
-        ema_options = ["5/9", "9/21", "9/30", "20/50", "50/200"]
-        selected_ema_pairs = st.multiselect(
-            "EMA CROSSOVERS",
-            options=ema_options,
-            default=["9/21"],
-            help="Select one or more EMA pairs to analyze crossovers"
-        )
-        
-        st.markdown(
-            '<div class="info-box">'
-            '🪙 <b>Delta Exchange Tickers</b><br>'
-            'Common symbols: BTCUSD, ETHUSD, SOLUSD, LTCUSD, DOGEUSD, BNBUSD, XRPUSD, ADAUSD, AVAXUSD<br>'
-            '<b>Format:</b> All uppercase, ends with USD<br>'
-            '<b>Hours:</b> 24/7 trading (crypto markets)<br>'
-            'If errors occur, verify ticker spelling or try a higher timeframe.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        
-        cache_ttl_lbl  = "30 s"
-        data_src_label = "Delta Exchange API"
-        src_color      = "#00d4ff"
+    avail_tfs  = list(TF_CRYPTO.keys()) if not is_india else list(TF_INDIA.keys())
+    timeframes = st.multiselect(
+        "TIMEFRAMES",
+        options=avail_tfs,
+        default=["5m", "1h"],
+    )
+    
+    ema_options = ["5/9", "9/21", "9/30", "20/50", "50/200"]
+    selected_ema_pairs = st.multiselect(
+        "EMA CROSSOVERS",
+        options=ema_options,
+        default=["9/21"],
+    )
 
     st.markdown('<hr style="border-color:#252830;">', unsafe_allow_html=True)
     auto_refresh = st.checkbox("AUTO REFRESH (30 s)", value=False)
     run_btn      = st.button("🔍 RUN ANALYSIS")
-    st.markdown('<hr style="border-color:#252830;">', unsafe_allow_html=True)
-
-    st.markdown(f"""
-    <div style="font-size:10px;color:#6b7280;line-height:1.8;">
-    <b style="color:{src_color};">INDICATORS</b><br>
-    ✦ EMA Crossover Detection<br>
-    ✦ Bollinger Bands (20, 2σ)<br>
-    ✦ RSI (14) — OB / OS levels<br>
-    ✦ Volume Trend (3 vs 5 candles)<br>
-    ✦ 200 EMA Trend Filter<br>
-    ✦ Support & Resistance (Swing Pivots)<br>
-    ✦ Breakout / Breakdown / Retracement<br>
-    ✦ Fibonacci Retracement (100-candle swing)<br>
-    <br>
-    <b style="color:{src_color};">DATA SOURCE</b><br>
-    {data_src_label}<br>
-    Cache TTL: {cache_ttl_lbl}
-    </div>
-    """, unsafe_allow_html=True)
 
 # ─── Main Panel ──────────────────────────────────────────────────────────────
 accent_col  = "#ff9500" if is_india else "#00d4ff"
 mode_line   = ("🇮🇳 Indian Stocks · NSE/BSE · Groww"
-               if is_india else "🪙 Crypto · Delta Exchange")
+               if is_india else "🪙 Crypto · Delta/CoinDCX")
 
 st.markdown(
     f'<h1 style="font-family:Bebas Neue,sans-serif;letter-spacing:4px;color:{accent_col};margin-bottom:0;">'
@@ -1128,80 +1369,34 @@ if auto_refresh:
     st.rerun()
 
 if run_btn or auto_refresh:
-    logger.info(f"Starting analysis run. Market: {'Groww' if is_india else 'Delta'}, Mode: {'auto-refresh' if auto_refresh else 'manual'}")
+    logger.info(f"Starting analysis run.")
     
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
     ema_pairs = [tuple(map(int, p.split("/"))) for p in selected_ema_pairs]
 
-    if not tickers:
-        error_msg = "No tickers provided by user"
-        logger.error(error_msg)
-        st.error("Please enter at least one ticker / symbol.")
+    if not tickers_to_analyse:
+        st.error("Please enter/select at least one ticker.")
     elif not timeframes:
-        error_msg = "No timeframes selected by user"
-        logger.error(error_msg)
         st.error("Please select at least one timeframe.")
-    elif is_india and not (groww_token and groww_token.strip()):
-        error_msg = "Groww token is missing or empty"
-        logger.error(error_msg)
-        st.markdown(
-            '<div class="error-box">⚠ Please enter your Groww Bearer token in the sidebar.<br>'
-            'Obtain it from <b>groww.in/trade-api</b> → API Keys.<br>'
-            '<b>Note:</b> Tokens expire every 24 hours and need to be refreshed.</div>',
-            unsafe_allow_html=True,
-        )
     else:
-        logger.info(f"Validation passed. Tickers: {tickers}, Timeframes: {timeframes}")
-        badge_extra = "ticker-badge-india" if is_india else ""
-        src_badge   = (
-            f'<span class="source-badge badge-india">GROWW · {groww_exchange}</span>'
-            if is_india else
-            '<span class="source-badge badge-crypto">DELTA EXCHANGE</span>'
-        )
-
-        for ticker in tickers:
-            st.markdown(
-                f'<div style="margin:24px 0 8px 0;">'
-                f'<span class="ticker-badge {badge_extra}">{ticker}</span>'
-                f'{src_badge}</div>',
-                unsafe_allow_html=True,
-            )
+        for ticker in tickers_to_analyse:
+            st.markdown(f'### {ticker}', unsafe_allow_html=True)
 
             for tf in timeframes:
-                tf_cls = "tf-header-india" if is_india else ""
-                st.markdown(
-                    f'<div class="tf-header {tf_cls}">⏱ {tf} — {ticker}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'#### ⏱ {tf}', unsafe_allow_html=True)
 
                 with st.spinner(f"Fetching {ticker} [{tf}]…"):
                     try:
-                        logger.info(f"Processing {ticker} [{tf}] on {'Groww' if is_india else 'Delta'}")
-                        
-                        if is_india:
-                            if not groww_token or not groww_token.strip():
-                                error_msg = f"Groww token missing for {ticker} [{tf}]"
-                                logger.error(error_msg)
-                                raise ValueError(error_msg)
-                            
-                            df = fetch_groww_ohlcv(
-                                ticker, groww_exchange, tf, groww_token, limit=1000
-                            )
+                        if market == "Groww (India Stocks)":
+                            df = fetch_groww_ohlcv(ticker, groww_exchange, tf, groww_token, limit=1000)
+                        elif market == "CoinDCX Futures":
+                            df = fetch_coindcx_ohlcv(ticker, tf, limit=1000)
                         else:
-                            # Validate ticker format for Delta
-                            if not ticker or len(ticker) < 3:
-                                error_msg = f"Invalid ticker format: '{ticker}'. Example: BTCUSD, ETHUSD"
-                                logger.error(error_msg)
-                                raise ValueError(error_msg)
-                            
+                            # Delta
                             df = fetch_delta_ohlcv(ticker, tf, limit=1000)
 
                         if df is None or df.empty:
-                            error_msg = f"No data returned for {ticker} [{tf}]"
-                            logger.error(error_msg)
-                            raise ValueError(error_msg)
-
-                        logger.info(f"Data fetch successful for {ticker} [{tf}]. Rows: {len(df)}")
+                            st.warning(f"No data for {ticker} [{tf}]")
+                            continue
                         
                         result = analyse(df, ticker, tf, ema_pairs=ema_pairs, currency=currency)
                         

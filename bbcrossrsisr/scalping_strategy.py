@@ -426,10 +426,15 @@ def fetch_groww_ohlcv(symbol: str, exchange: str, tf_key: str,
         minutes, max_days, _ = TF_INDIA[tf_key]
 
         now          = datetime.now()
-        # Account for limited market hours in India (approx 6.25h/24h)
-        # We multiply the lookback to ensure we get enough calendar days for the requested candle limit
-        lookback_multiplier = 4 if tf_key != "1d" else 1.6
-        lookback_min = min(int(minutes * limit * lookback_multiplier), max_days * 24 * 60)
+        # Account for limited market hours in India (375 mins/day) and weekends/holidays
+        trading_days_needed = max(1, (minutes * limit) // 375 + 1)
+        calendar_days_needed = trading_days_needed + (trading_days_needed // 5) * 2 + 5
+        
+        # Ensure minimum lookback of 7 days for intraday to cross long weekends safely
+        if tf_key != "1d":
+            calendar_days_needed = max(7, calendar_days_needed)
+            
+        lookback_min = min(calendar_days_needed * 24 * 60, max_days * 24 * 60)
         start_dt     = now - timedelta(minutes=lookback_min)
 
         # Format: "YYYY-MM-DD HH:MM:SS"

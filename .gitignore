@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+etf/
+# Virtual Environment
+venv/
+.venv/
+env/
+historical_data/
+historical_data_crypto/
+
+# Environment Variables
+# .env
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Project specific
+# Uncomment the following line if you don't want to commit the JSON database
+# monthlyetf/buy_tracking.json

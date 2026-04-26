@@ -1,0 +1,21 @@
+Symbol,Strategy,Entry,SL,Target,R:R,Strategy Score,AI Score,Final Score,Category,AI Reason
+AXISBANK,EMA Crossover,1375.0,1350.3,1396.57,1:0.87,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a bullish trend with price above EMA50 and EMA20 rising sharply, indicating strong momentum. The risk-reward ratio is nearly 1:1, making it a reasonable entry point."
+FINPIPE,Fibonacci Retracement,175.05,156.46,204.6,1:1.59,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The stock is experiencing a shallow pullback at 38.2% Fib, indicating a strong trend. The RSI is neutral and volume is tapering on pullback, supporting a potential uptrend."
+GMDCLTD,Fibonacci Retracement,680.95,572.92,839.6,1:1.47,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The strategy indicates a valid Fibonacci pullback with a shallow retracement, and the RSI is neutral, suggesting a potential uptrend. The risk-reward ratio of 1:1.47 also supports a buying decision."
+NAVINFLUOR,Fibonacci Retracement,6276.0,5839.98,6879.35,1:1.38,78,78,78,✅ BUY,"Score: 78
+Confidence: High
+Decision: BUY
+Reason: The strategy score indicates a strong Fibonacci retracement setup, with a shallow pullback and recovering RSI. The risk-reward ratio of 1:1.38 also favors a buy decision."
+PFIZER,Fibonacci Retracement,4784.9,4618.38,5187.26,1:2.42,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a strong Fibonacci entry zone and recovering RSI, indicating momentum return. However, the HTF downtrend poses a risk, making it a moderate confidence trade."

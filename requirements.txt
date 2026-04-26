@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+plotly
+python-dotenv
+google-genai
+growwapi
+groq
+requests

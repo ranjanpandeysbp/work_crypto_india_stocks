@@ -1,0 +1,53 @@
+Symbol,Strategy,Entry,SL,Target,R:R,Strategy Score,AI Score,Final Score,Category,AI Reason
+AXISBANK,EMA Crossover,1375.0,1350.3,1396.57,1:0.87,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a bullish trend with price above EMA50 and EMA20 rising sharply, indicating strong momentum. The risk-reward ratio is nearly 1:1, making it a reasonable entry point."
+FINPIPE,Fibonacci Retracement,175.05,156.46,204.6,1:1.59,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The stock is experiencing a shallow pullback at 38.2% Fib, indicating a strong trend. The RSI is neutral and volume is tapering on pullback, supporting a potential uptrend."
+GMDCLTD,Fibonacci Retracement,680.95,572.92,839.6,1:1.47,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The strategy indicates a valid Fibonacci pullback with a shallow retracement, and the RSI is neutral, suggesting a potential uptrend. The risk-reward ratio of 1:1.47 also supports a buying decision."
+NAVINFLUOR,Fibonacci Retracement,6276.0,5839.98,6879.35,1:1.38,78,78,78,✅ BUY,"Score: 78
+Confidence: High
+Decision: BUY
+Reason: The strategy score indicates a strong Fibonacci retracement setup, with a shallow pullback and recovering RSI. The risk-reward ratio of 1:1.38 also favors a buy decision."
+PFIZER,Fibonacci Retracement,4784.9,4618.38,5187.26,1:2.42,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a strong Fibonacci entry zone and recovering RSI, indicating momentum return. However, the HTF downtrend poses a risk, making it a moderate confidence trade."
+RELIANCE,RSI Divergence,1344.4,1286.47,1369.1,1:0.43,₹1286.47,₹1369.10,100,80,88,🔥 STRONG BUY,"Score: 80
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a strong bullish RSI divergence and the price is near a support zone, indicating a potential reversal. However, the HTF is below EMA200, which suggests a countertrend trade and reduces overall confidence.",,,
+RELIANCE,Price & RSI Divergence,1344.4,1330.29,1370.7,1:1.86,₹1330.29,₹1370.70,70,70,70,✅ BUY,"Score: 70
+Confidence: Medium
+Decision: BUY
+Reason: The trade has a classic bullish RSI divergence and a strong recovery candle, with the RSI in the oversold zone. However, the stock is trading below the EMA200, which is a counter-trend divergence trade, hence the medium confidence.",,,
+RELIANCE,Market Condition Scanner,1344.4,1330.57,1351.58,1:0.52,"₹1332.69, ₹1308.50","₹1352.29, ₹1353.71",75,75,75,✅ BUY,"Score: 75
+Confidence: High
+Decision: BUY
+Reason: The strategy score is high and the market condition is fair value, with a good risk:reward entry at the support level. The RSI is neutral-low, indicating potential for a bounce.",🟢 FAIR VALUE,-23,IDEAL ZONE — Best risk:reward for new entries
+HDFCBANK,Market Condition Scanner,783.9,782.57,794.35,1:7.86,"₹783.86, ₹740.52","₹794.78, ₹797.21",85,85,85,🔥 STRONG BUY,"Score: 85
+Confidence: High
+Decision: BUY
+Reason: The stock is mildly oversold and near a strong support zone, with a high probability of a reversal. The risk-reward ratio is also favorable at 1:7.86.",🔵 MILDLY OVERSOLD,-63,WATCH — Look for reversal signals; prepare buy levels
+AXISBANK,Market Condition Scanner,1369.2,1356.21,1372.0,1:0.22,"₹1359.19, ₹1355.05","₹1372.99, ₹1376.01",75,75,75,✅ BUY,"Score: 75
+Confidence: High
+Decision: BUY
+Reason: The strategy score is 75 and the market condition is fair value, with the price near the EMA50 support level. The risk-reward ratio is 1:0.22, indicating a good entry point.",🟢 FAIR VALUE,-18,IDEAL ZONE — Best risk:reward for new entries
+RELIANCE,RSI Divergence,1344.4,1253.7,1598.5,1:2.8,₹1253.70,₹1598.50,88,88,88,🔥 STRONG BUY,"Score: 88
+Confidence: High
+Decision: BUY
+Reason: The trade has a strong bullish RSI divergence signal, with the price near a support zone and the RSI oversold, indicating a likely reversal. The risk-reward ratio of 1:2.8 also favors a long position.",,,
+RELIANCE,Price & RSI Divergence,1344.4,1199.2,1611.8,1:1.84,₹1199.20,₹1611.80,92,92,92,🔥 STRONG BUY,"Score: 92
+Confidence: High
+Decision: BUY
+Reason: The trade has a high strategy score with multiple bullish signals, including a classic bullish RSI divergence and a rising MACD histogram. The risk-to-reward ratio of 1:1.84 also supports a long position.",,,
+RELIANCE,Market Condition Scanner,1344.4,1310.91,1358.95,1:0.43,"₹1332.69, ₹1308.50","₹1366.21, ₹1389.75",75,75,75,✅ BUY,"Score: 75
+Confidence: Medium
+Decision: BUY
+Reason: The strategy score is 75 and the market condition is fair value, indicating a good risk:reward entry. The stock is trading near a strong support zone, increasing the likelihood of a bounce back to the target price.",🟢 FAIR VALUE,-28,IDEAL ZONE — Best risk:reward for new entries
